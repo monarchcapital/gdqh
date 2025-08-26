@@ -412,23 +412,51 @@ st.title("Brazilian DI Futures Yield Curve Forecast")
 
 # --- NEW: PCA Components Heatmap ---
 st.header("Principal Component Analysis Overview")
-st.write("This heatmap shows how each Principal Component (PC) influences different maturities on the yield curve. This is based on the entire training data period.")
+st.write("This heatmap shows how each Principal Component (PC) influences different maturities on the yield curve. You can select a specific date range below to see how the components behaved during that period.")
 st.write("- **PC1 (Level):** Typically shows a parallel shift in the curve.")
 st.write("- **PC2 (Slope):** Typically shows a steepening or flattening of the curve.")
 st.write("- **PC3 (Curvature):** Typically shows a change in the curve's bow or flex.")
 
-fig_heatmap, ax_heatmap = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
-sns.heatmap(
-    pca.components_,
-    xticklabels=std_cols,
-    yticklabels=pc_cols,
-    annot=True,
-    fmt=".2f",
-    cmap='viridis',
-    ax=ax_heatmap
-)
-ax_heatmap.set_title("PCA Component Loadings vs. Maturity")
-st.pyplot(fig_heatmap)
+# --- UI for Heatmap Date Range Selection ---
+min_heatmap_date = pca_df_filled.index.min().date()
+max_heatmap_date = pca_df_filled.index.max().date()
+
+st.markdown("##### Select Date Range for Heatmap")
+col1, col2 = st.columns(2)
+heatmap_start_date = col1.date_input("Heatmap Start Date", value=min_heatmap_date, min_value=min_heatmap_date, max_value=max_heatmap_date, key="heatmap_start")
+heatmap_end_date = col2.date_input("Heatmap End Date", value=max_heatmap_date, min_value=min_heatmap_date, max_value=max_heatmap_date, key="heatmap_end")
+
+if heatmap_start_date > heatmap_end_date:
+    st.error("Heatmap start date cannot be after the end date.")
+else:
+    # Filter the main PCA data frame for the selected heatmap range
+    heatmap_mask = (pca_df_filled.index.date >= heatmap_start_date) & (pca_df_filled.index.date <= heatmap_end_date)
+    pca_df_for_heatmap = pca_df_filled.loc[heatmap_mask]
+
+    # Validate that there's enough data to run the PCA for the heatmap
+    if len(pca_df_for_heatmap) < n_components:
+        st.warning(f"Not enough data ({len(pca_df_for_heatmap)} days) in the selected range to compute {n_components} components for the heatmap. Please select a wider date range.")
+    else:
+        # Re-run PCA specifically for the selected date range for visualization purposes
+        scaler_heatmap = StandardScaler(with_std=False)
+        X_heatmap = scaler_heatmap.fit_transform(pca_df_for_heatmap.values.astype(float))
+        
+        pca_heatmap = PCA(n_components=n_components)
+        pca_heatmap.fit(X_heatmap)
+        
+        # Plot the heatmap using the components from the date-range-specific PCA
+        fig_heatmap, ax_heatmap = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
+        sns.heatmap(
+            pca_heatmap.components_,  # Use the components from the new, localized PCA
+            xticklabels=std_cols,
+            yticklabels=pc_cols,
+            annot=True,
+            fmt=".2f",
+            cmap='viridis',
+            ax=ax_heatmap
+        )
+        ax_heatmap.set_title(f"PCA Component Loadings ({heatmap_start_date} to {heatmap_end_date})")
+        st.pyplot(fig_heatmap)
 
 
 # --- Get the last actual curve ---
