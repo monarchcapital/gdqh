@@ -291,14 +291,14 @@ def row_to_std_grid(dt, row_series, available_contracts, expiry_df, std_arr, hol
 def std_grid_to_contracts(dt, std_curve_rates, std_arr, expiry_df, all_contracts, holidays_np, year_basis, rate_unit, compounding_model, interp_method):
     """Converts a curve on the standard grid back to individual contract rates."""
     contract_rates = pd.Series(index=all_contracts, dtype=float)
-    
+
     interp_func = interp1d(std_arr, std_curve_rates, kind=interp_method, bounds_error=False, fill_value='extrapolate')
 
     for contract in all_contracts:
         mat_up = str(contract).strip().upper()
         if mat_up not in expiry_df.index:
             continue
-        
+
         exp = expiry_df.loc[mat_up, "DATE"]
         if pd.isna(exp) or pd.Timestamp(exp).date() < dt.date():
             continue
@@ -318,7 +318,7 @@ def std_grid_to_contracts(dt, std_curve_rates, std_arr, expiry_df, all_contracts
             DF = (1.0 + zero_frac) ** (-t)
             r_daily = DF ** (-1.0 / T) - 1.0
             rate_frac = r_daily * float(year_basis)
-        
+
         if "Percent" in rate_unit:
              contract_rates[contract] = rate_frac * 100.0
         elif "Basis" in rate_unit:
@@ -327,7 +327,6 @@ def std_grid_to_contracts(dt, std_curve_rates, std_arr, expiry_df, all_contracts
              contract_rates[contract] = rate_frac
 
     return contract_rates.dropna()
-
 
 @st.cache_data
 def build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, compounding_model, interp_method):
@@ -350,33 +349,107 @@ def build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basi
         pca_vals[inds] = np.take(col_means, inds[1])
     return pd.DataFrame(pca_vals, index=pca_df.index, columns=pca_df.columns)
 
-
 pca_df_filled = build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, compounding_model, interp_method)
 
 # --------------------------
-# PCA (Main model for forecast and reconstruction)
+# Main Panel
 # --------------------------
-scaler = StandardScaler(with_std=False)
-X = scaler.fit_transform(pca_df_filled.values.astype(float))
-
-max_components = int(min(X.shape[0], X.shape[1]))
-n_components = int(min(int(n_components_sel), max_components))
-if n_components < int(n_components_sel):
-    st.info(f"Reduced PCA components from {int(n_components_sel)} to {n_components} (limited by samples/features).")
-
-pca = PCA(n_components=n_components)
-PCs = pca.fit_transform(X)
-pc_cols = [f"PC{i+1}" for i in range(n_components)]
-PCs_df = pd.DataFrame(PCs, index=pca_df_filled.index, columns=pc_cols)
+st.title("Brazilian DI Futures Yield Curve Forecast")
 
 # --------------------------
-# Utilities for reconstruction/forecast
+# In-Sample Curve Reconstruction (select date FIRST so PCA can be dynamic)
 # --------------------------
-def reconstruct_curve_at_index(i_row: int) -> np.ndarray:
-    x_centered = pca.inverse_transform(PCs[i_row].reshape(1, -1)).ravel()
-    return scaler.inverse_transform(x_centered.reshape(1, -1)).ravel()
+st.markdown("---")
+st.header("In-Sample Curve Reconstruction")
+recon_min, recon_max = pca_df_filled.index.min().date(), pca_df_filled.index.max().date()
+recon_date = st.date_input("Select date for reconstruction", value=recon_max, min_value=recon_min, max_value=recon_max, key="recon_date_pick")
+recon_ts = pd.Timestamp(recon_date)
 
-# --- FORECASTING FUNCTIONS ---
+mask_pca_row = pca_df_filled.index.normalize() == recon_ts.normalize()
+if not mask_pca_row.any():
+    st.error(f"Selected date {recon_ts.date()} is not present in the training data. Please check your PCA Training Date range in the sidebar.")
+    st.stop()
+
+# --------------------------
+# Build dynamic PCA up to the selected date
+# --------------------------
+def build_dynamic_pca(up_to_ts, n_components_sel):
+    scaler_dyn = StandardScaler(with_std=False)
+    mask_dyn = pca_df_filled.index <= up_to_ts
+    X_dyn = scaler_dyn.fit_transform(pca_df_filled.loc[mask_dyn].values.astype(float))
+    max_components_dyn = int(min(X_dyn.shape[0], X_dyn.shape[1]))
+    n_components_dyn = int(min(int(n_components_sel), max_components_dyn))
+    if n_components_dyn < int(n_components_sel):
+        st.info(f"Reduced PCA components from {int(n_components_sel)} to {n_components_dyn} (limited by samples/features up to {up_to_ts.date()}).")
+    pca_dyn = PCA(n_components=n_components_dyn)
+    PCs_dyn = pca_dyn.fit_transform(X_dyn)
+    pc_cols_dyn = [f"PC{i+1}" for i in range(n_components_dyn)]
+    PCs_df_dyn = pd.DataFrame(PCs_dyn, index=pca_df_filled.loc[mask_dyn].index, columns=pc_cols_dyn)
+    return pca_dyn, scaler_dyn, PCs_df_dyn
+
+pca, scaler, PCs_df = build_dynamic_pca(recon_ts, n_components_sel)
+pc_cols = list(PCs_df.columns)
+
+# --------------------------
+# PCA Components Heatmap (Dynamic)
+# --------------------------
+st.header("Principal Component Analysis Overview")
+st.write("This heatmap shows how each Principal Component (PC) influences different maturities on the yield curve.")
+fig_heatmap, ax_heatmap = plt.subplots(figsize=(12, max(4, pca.n_components_ * 1.5)))
+sns.heatmap(
+    pca.components_,
+    xticklabels=std_cols,
+    yticklabels=pc_cols,
+    annot=True,
+    fmt=".2f",
+    cmap='viridis',
+    ax=ax_heatmap
+)
+ax_heatmap.set_title(f"PCA Component Loadings vs. Maturity (up to {recon_ts.date()})")
+st.pyplot(fig_heatmap)
+
+# --- Prepare last & previous days relative to selected date
+last_actual_ts = pca_df_filled.loc[:recon_ts].index.max()
+last_actual_curve_on_std = pca_df_filled.loc[last_actual_ts].values
+
+prev_actual_ts = None
+prev_actual_curve_on_std = np.full_like(std_arr, np.nan)
+hist_index = pca_df_filled.loc[:recon_ts].index
+if len(hist_index) > 1:
+    prev_actual_ts = hist_index[-2]
+    prev_actual_curve_on_std = pca_df_filled.loc[prev_actual_ts].values
+
+# --- Reconstruct curve for recon_ts using dynamic PCA
+i_row = int(np.where(pca_df_filled.index.get_indexer([recon_ts]))[0][0])  # position in full index
+# Map to position within dynamic subset
+i_dyn = PCs_df.index.get_loc(recon_ts)
+recon_curve_std = scaler.inverse_transform(pca.inverse_transform(PCs_df.iloc[i_dyn].values.reshape(1, -1))).ravel()
+orig_on_std = pca_df_filled.loc[recon_ts].values
+
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(std_arr, recon_curve_std, marker='o', linestyle='-', color='royalblue', label=f"Reconstructed ({pca.n_components_} PCs)")
+ax.plot(std_arr, orig_on_std, marker='x', linestyle='--', color='darkorange', label="Original (interpolated on grid)")
+if show_previous_curve and prev_actual_ts is not None:
+    ax.plot(std_arr, prev_actual_curve_on_std, marker='+', linestyle=':', color='green', label=f"Previous Day Curve ({prev_actual_ts.date()})")
+ax.set_xticks(std_arr)
+ax.set_xticklabels([f"{m:.2f}Y" for m in std_arr], rotation=45, ha="right")
+ax.set_xlabel("Standardized Maturity (Years)", fontsize=12)
+ax.set_ylabel("Zero Rate (%)", fontsize=12)
+ax.set_title(f"Curve Reconstruction for {recon_ts.date()} on Standard Grid", fontsize=16, pad=20)
+ax.legend(fontsize=10)
+ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.tight_layout()
+st.pyplot(fig)
+
+# --------------------------
+# Next-BD forecast (Dynamic PCA)
+# --------------------------
+st.markdown("---")
+st.header(f"Next Business Day Forecast (by Contract)")
+
+train_end_ts = last_actual_ts
+forecast_ts = next_business_day(train_end_ts, holidays_np)
+
 def forecast_pcs_avg_delta(PCs_matrix, window=5, pc_damp=0.5):
     if PCs_matrix.shape[0] == 0: return np.zeros((1, PCs_matrix.shape[1]))
     n, k = PCs_matrix.shape
@@ -405,134 +478,15 @@ def forecast_pcs_arima(PCs_df):
         forecasts.append(ARIMA(series, order=(1, 1, 0)).fit().forecast(steps=1).iloc[0])
     return np.array(forecasts).reshape(1, -1)
 
-# --------------------------
-# Main Panel
-# --------------------------
-st.title("Brazilian DI Futures Yield Curve Forecast")
-
-# --- DYNAMIC PCA Components Heatmap ---
-st.header("Principal Component Analysis Overview")
-st.write("This heatmap shows how each Principal Component (PC) influences different maturities on the yield curve. You can select a specific date range below to see how the components behaved during that period.")
-st.write("- **PC1 (Level):** Typically shows a parallel shift in the curve.")
-st.write("- **PC2 (Slope):** Typically shows a steepening or flattening of the curve.")
-st.write("- **PC3 (Curvature):** Typically shows a change in the curve's bow or flex.")
-
-# --- UI for Heatmap Date Range Selection ---
-min_heatmap_date = pca_df_filled.index.min().date()
-max_heatmap_date = pca_df_filled.index.max().date()
-
-st.markdown("##### Select Date Range for Heatmap")
-col1, col2 = st.columns(2)
-heatmap_start_date = col1.date_input("Heatmap Start Date", value=min_heatmap_date, min_value=min_heatmap_date, max_value=max_heatmap_date, key="heatmap_start")
-heatmap_end_date = col2.date_input("Heatmap End Date", value=max_heatmap_date, min_value=min_heatmap_date, max_value=max_heatmap_date, key="heatmap_end")
-
-if heatmap_start_date > heatmap_end_date:
-    st.error("Heatmap start date cannot be after the end date.")
-else:
-    # Filter the main PCA data frame for the selected heatmap range
-    heatmap_mask = (pca_df_filled.index.date >= heatmap_start_date) & (pca_df_filled.index.date <= heatmap_end_date)
-    pca_df_for_heatmap = pca_df_filled.loc[heatmap_mask]
-
-    # Validate that there's enough data to run the PCA for the heatmap
-    if len(pca_df_for_heatmap) < n_components:
-        st.warning(f"Not enough data ({len(pca_df_for_heatmap)} days) in the selected range to compute {n_components} components for the heatmap. Please select a wider date range.")
-    else:
-        # Re-run PCA specifically for the selected date range for visualization purposes
-        scaler_heatmap = StandardScaler(with_std=False)
-        X_heatmap = scaler_heatmap.fit_transform(pca_df_for_heatmap.values.astype(float))
-        
-        pca_heatmap = PCA(n_components=n_components)
-        pca_heatmap.fit(X_heatmap)
-        
-        # --- DIAGNOSTIC BLOCK ---
-        st.subheader("Debugging Information")
-        st.write("Please check if these values change when you adjust the heatmap dates above.")
-        st.info(f"Full training data shape: `{pca_df_filled.shape}` (This should not change)")
-        st.info(f"Filtered data shape for heatmap: `{pca_df_for_heatmap.shape}` (This **should change**)")
-
-        main_pc1_snippet = pca.components_[0, :3]
-        heatmap_pc1_snippet = pca_heatmap.components_[0, :3]
-        st.info(f"Main Model PC1 (first 3 values): `{np.round(main_pc1_snippet, 3)}` (This should not change)")
-        st.warning(f"Heatmap Model PC1 (first 3 values): `{np.round(heatmap_pc1_snippet, 3)}` (This **should change**)")
-        # --- END DIAGNOSTIC BLOCK ---
-
-        # Plot the heatmap using the components from the date-range-specific PCA
-        fig_heatmap, ax_heatmap = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
-        sns.heatmap(
-            pca_heatmap.components_,  # CRITICAL: This uses the new, localized PCA model
-            xticklabels=std_cols,
-            yticklabels=pc_cols,
-            annot=True,
-            fmt=".2f",
-            cmap='viridis',
-            ax=ax_heatmap
-        )
-        ax_heatmap.set_title(f"PCA Component Loadings ({heatmap_start_date} to {heatmap_end_date})")
-        st.pyplot(fig_heatmap)
-
-
-# --- Get the last actual curve ---
-last_actual_ts = yields_df_train.index.max()
-last_actual_curve_on_std = pca_df_filled.loc[last_actual_ts].values
-
-# --- Get the PREVIOUS day's curve for comparison ---
-prev_actual_ts = None
-prev_actual_curve_on_std = np.full_like(std_arr, np.nan)
-if len(yields_df_train.index) > 1:
-    prev_actual_ts = yields_df_train.index[-2]
-    prev_actual_curve_on_std = pca_df_filled.loc[prev_actual_ts].values
-
-# --------------------------
-# In-sample reconstruction (exact date)
-# --------------------------
-st.markdown("---")
-st.header("In-Sample Curve Reconstruction")
-recon_min, recon_max = pca_df_filled.index.min().date(), pca_df_filled.index.max().date()
-recon_date = st.date_input("Select date for reconstruction", value=recon_max, min_value=recon_min, max_value=recon_max, key="recon_date_pick")
-recon_ts = pd.Timestamp(recon_date)
-
-mask_pca = pca_df_filled.index.normalize() == recon_ts.normalize()
-if not mask_pca.any():
-    st.error(f"Selected date {recon_ts.date()} is not present in the training data. Please check your PCA Training Date range in the sidebar.")
-else:
-    i = int(np.where(mask_pca)[0][0])
-    recon_curve_std = reconstruct_curve_at_index(i)
-    orig_on_std = pca_df_filled.loc[recon_ts].values
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(std_arr, recon_curve_std, marker='o', linestyle='-', color='royalblue', label=f"Reconstructed ({n_components} PCs)")
-    ax.plot(std_arr, orig_on_std, marker='x', linestyle='--', color='darkorange', label="Original (interpolated on grid)")
-    if show_previous_curve and prev_actual_ts is not None:
-        ax.plot(std_arr, prev_actual_curve_on_std, marker='+', linestyle=':', color='green', label=f"Previous Day Curve ({prev_actual_ts.date()})")
-    ax.set_xticks(std_arr)
-    ax.set_xticklabels([f"{m:.2f}Y" for m in std_arr], rotation=45, ha="right")
-    ax.set_xlabel("Standardized Maturity (Years)", fontsize=12)
-    ax.set_ylabel("Zero Rate (%)", fontsize=12)
-    ax.set_title(f"Curve Reconstruction for {recon_ts.date()} on Standard Grid", fontsize=16, pad=20)
-    ax.legend(fontsize=10)
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    plt.tight_layout()
-    st.pyplot(fig)
-
-# --------------------------
-# Next-BD forecast
-# --------------------------
-st.markdown("---")
-st.header(f"Next Business Day Forecast (by Contract)")
-
-train_end_ts = pca_df_filled.index.max()
-forecast_ts = next_business_day(train_end_ts, holidays_np)
-
 # --- Select and run the chosen forecast model ---
 if forecast_model_type == "None (PCA Fair Value)":
     st.write("Using **PCA Fair Value** model (no momentum or external forecast)")
-    # The "Fair Value" forecast is the smooth, reconstructed curve of the last day.
-    last_day_pcs_index = pca_df_filled.index.get_loc(last_actual_ts)
-    pred_curve_std = reconstruct_curve_at_index(last_day_pcs_index)
+    last_day_pcs_index = PCs_df.index.get_loc(last_actual_ts)
+    pred_curve_std = scaler.inverse_transform(pca.inverse_transform(PCs_df.iloc[last_day_pcs_index].values.reshape(1, -1))).ravel()
 else:
     if forecast_model_type == "Average Delta (Momentum)":
         st.write(f"Using **{forecast_model_type}** model")
-        pcs_next = forecast_pcs_avg_delta(PCs, window=int(rolling_window_days), pc_damp=float(pc_damp))
+        pcs_next = forecast_pcs_avg_delta(PCs_df.values, window=int(rolling_window_days), pc_damp=float(pc_damp))
     elif forecast_model_type == "VAR (Vector Autoregression)":
         st.write(f"Using **{forecast_model_type}** model")
         pcs_next = forecast_pcs_var(PCs_df, lags=int(var_lags))
@@ -544,7 +498,8 @@ else:
     last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
     delta_pcs = pcs_next - last_pcs
     delta_curve = pca.inverse_transform(delta_pcs)
-    pred_curve_std = last_actual_curve_on_std + delta_curve.flatten()
+    last_actual_curve_on_std_dyn = scaler.inverse_transform(pca.inverse_transform(last_pcs)).ravel()
+    pred_curve_std = last_actual_curve_on_std_dyn + delta_curve.flatten()
 
 # --- Apply Capping to momentum-based models ---
 if apply_cap and cap_bps > 0 and forecast_model_type != "None (PCA Fair Value)":
@@ -553,7 +508,6 @@ if apply_cap and cap_bps > 0 and forecast_model_type != "None (PCA Fair Value)":
     capped_pred_std = last_actual_curve_on_std + delta
 else:
     capped_pred_std = pred_curve_std
-
 
 # --- Convert curves from standard grid back to contracts ---
 all_contracts = yields_df.columns
@@ -599,9 +553,9 @@ st.header("Fair Value Spread Analysis")
 st.write(f"This section compares the **Last Actual** market rates against the **PCA Fair Value** for that same day ({last_actual_ts.date()}).")
 st.write("A positive spread means the actual market rate is higher than the model's fair value (potentially overpriced). A negative spread means it's lower (potentially underpriced).")
 
-# Calculate the PCA Fair Value for the last actual day
-last_day_pcs_index = pca_df_filled.index.get_loc(last_actual_ts)
-fair_value_std = reconstruct_curve_at_index(last_day_pcs_index)
+# Calculate the PCA Fair Value for the last actual day (uses the same dynamic PCA up to recon date)
+last_day_pcs_index = PCs_df.index.get_loc(last_actual_ts)
+fair_value_std = scaler.inverse_transform(pca.inverse_transform(PCs_df.iloc[last_day_pcs_index].values.reshape(1, -1))).ravel()
 fair_value_contracts = std_grid_to_contracts(last_actual_ts, fair_value_std, std_arr, expiry_df, all_contracts, holidays_np, year_basis, rate_unit, compounding_model, interp_method)
 
 # Align the series and calculate the spread
