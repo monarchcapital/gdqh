@@ -354,7 +354,7 @@ def build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basi
 pca_df_filled = build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, compounding_model, interp_method)
 
 # --------------------------
-# PCA
+# PCA (Main model for forecast and reconstruction)
 # --------------------------
 scaler = StandardScaler(with_std=False)
 X = scaler.fit_transform(pca_df_filled.values.astype(float))
@@ -410,7 +410,7 @@ def forecast_pcs_arima(PCs_df):
 # --------------------------
 st.title("Brazilian DI Futures Yield Curve Forecast")
 
-# --- NEW: PCA Components Heatmap ---
+# --- DYNAMIC PCA Components Heatmap ---
 st.header("Principal Component Analysis Overview")
 st.write("This heatmap shows how each Principal Component (PC) influences different maturities on the yield curve. You can select a specific date range below to see how the components behaved during that period.")
 st.write("- **PC1 (Level):** Typically shows a parallel shift in the curve.")
@@ -447,7 +447,7 @@ else:
         # Plot the heatmap using the components from the date-range-specific PCA
         fig_heatmap, ax_heatmap = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
         sns.heatmap(
-            pca_heatmap.components_,  # Use the components from the new, localized PCA
+            pca_heatmap.components_,  # CRITICAL: This uses the new, localized PCA model
             xticklabels=std_cols,
             yticklabels=pc_cols,
             annot=True,
