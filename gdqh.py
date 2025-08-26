@@ -444,6 +444,18 @@ else:
         pca_heatmap = PCA(n_components=n_components)
         pca_heatmap.fit(X_heatmap)
         
+        # --- DIAGNOSTIC BLOCK ---
+        st.subheader("Debugging Information")
+        st.write("Please check if these values change when you adjust the heatmap dates above.")
+        st.info(f"Full training data shape: `{pca_df_filled.shape}` (This should not change)")
+        st.info(f"Filtered data shape for heatmap: `{pca_df_for_heatmap.shape}` (This **should change**)")
+
+        main_pc1_snippet = pca.components_[0, :3]
+        heatmap_pc1_snippet = pca_heatmap.components_[0, :3]
+        st.info(f"Main Model PC1 (first 3 values): `{np.round(main_pc1_snippet, 3)}` (This should not change)")
+        st.warning(f"Heatmap Model PC1 (first 3 values): `{np.round(heatmap_pc1_snippet, 3)}` (This **should change**)")
+        # --- END DIAGNOSTIC BLOCK ---
+
         # Plot the heatmap using the components from the date-range-specific PCA
         fig_heatmap, ax_heatmap = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
         sns.heatmap(
