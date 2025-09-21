@@ -11,6 +11,9 @@
 #  - **NEW: Added a default "PCA Fair Value" forecast model.**
 #  - **NEW: Added a "Fair Value Spread Analysis" section to identify mispricing.**
 #  - **NEW: Added a PCA components heatmap for intuitive analysis.**
+#  - **NEW: Added spreads and butterflies to the PCA analysis.**
+#  - **NEW: Added a contract-based butterfly chart and spread comparison table.**
+#  - **NEW: Added forecasted spreads and butterflies with contract ticker labels.**
 #
 # Includes:
 #  - No "fallback" bug: reconstruction honors the chosen date exactly.
@@ -328,19 +331,81 @@ def std_grid_to_contracts(dt, std_curve_rates, std_arr, expiry_df, all_contracts
 
     return contract_rates.dropna()
 
+def get_contract_names_for_maturities(maturities_list, expiry_df, last_date, holidays_np, year_basis):
+    """
+    Finds the contract tickers corresponding to a list of maturities (ttm_years)
+    for a given date. This uses a more robust "closest match" method.
+    """
+    contract_names = []
+    
+    # Calculate TTM for all available contracts on the last date
+    ttm_to_contract = {}
+    for contract, exp_date in expiry_df["DATE"].items():
+        if pd.isna(exp_date) or pd.Timestamp(exp_date).date() < last_date.date(): continue
+        ttm = calculate_ttm(last_date, exp_date, holidays_np, year_basis)
+        if not np.isnan(ttm):
+            ttm_to_contract[ttm] = contract
+            
+    ttm_vals = np.array(list(ttm_to_contract.keys()))
+            
+    for m in maturities_list:
+        if len(ttm_vals) == 0:
+            contract_names.append("N/A")
+            continue
+        
+        # Find the index of the closest TTM
+        closest_idx = np.abs(ttm_vals - m).argmin()
+        closest_ttm = ttm_vals[closest_idx]
+        
+        contract_names.append(ttm_to_contract[closest_ttm])
+        
+    return contract_names
+
+def get_contract_names_for_spreads_flies(maturity_labels, expiry_df, last_date, holidays_np, year_basis):
+    """
+    Maps maturity-based spread and fly labels (e.g., '0.50Y-0.25Y') to contract tickers.
+    """
+    contract_labels = []
+    for label in maturity_labels:
+        parts = label.split('-')
+        maturities = [float(p[:-1]) for p in parts]
+        contracts = get_contract_names_for_maturities(maturities, expiry_df, last_date, holidays_np, year_basis)
+        if 'N/A' in contracts:
+            contract_labels.append('N/A')
+        else:
+            contract_labels.append('-'.join(contracts))
+    return contract_labels
 
 # @st.cache_data
 def build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, compounding_model, interp_method):
-    pca_df = pd.DataFrame(np.nan, index=yields_df_train.index, columns=std_cols, dtype=float)
+    # Step 1: Create a DataFrame for zero rates on the standard grid
+    pca_df_zeros = pd.DataFrame(np.nan, index=yields_df_train.index, columns=std_cols, dtype=float)
     available_contracts = yields_df_train.columns
-
     for dt in yields_df_train.index:
-        pca_df.loc[dt] = row_to_std_grid(
+        pca_df_zeros.loc[dt] = row_to_std_grid(
             dt, yields_df_train.loc[dt], available_contracts, expiry_df, 
             std_arr, holidays_np, year_basis, rate_unit, compounding_model, interp_method
         )
+    
+    # Step 2: Calculate Spreads
+    spread_cols = [f"{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols))]
+    pca_df_spreads = pd.DataFrame(np.nan, index=pca_df_zeros.index, columns=spread_cols, dtype=float)
+    for i in range(1, len(std_cols)):
+        col_name = f"{std_cols[i]}-{std_cols[i-1]}"
+        pca_df_spreads[col_name] = pca_df_zeros[std_cols[i]] - pca_df_zeros[std_cols[i-1]]
 
-    pca_vals = pca_df.values.astype(float)
+    # Step 3: Calculate Butterflies
+    fly_cols = [f"{std_cols[i+1]}-{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols) - 1)]
+    pca_df_flies = pd.DataFrame(np.nan, index=pca_df_zeros.index, columns=fly_cols, dtype=float)
+    for i in range(1, len(std_cols) - 1):
+        col_name = f"{std_cols[i+1]}-{std_cols[i]}-{std_cols[i-1]}"
+        pca_df_flies[col_name] = (pca_df_zeros[std_cols[i+1]] - pca_df_zeros[std_cols[i]]) - (pca_df_zeros[std_cols[i]] - pca_df_zeros[std_cols[i-1]])
+
+    # Step 4: Combine all series into a single PCA matrix
+    pca_df_combined = pd.concat([pca_df_zeros, pca_df_spreads, pca_df_flies], axis=1)
+
+    # Fill NaN values with the column mean (after calculation)
+    pca_vals = pca_df_combined.values.astype(float)
     col_means = np.nanmean(pca_vals, axis=0)
     if np.isnan(col_means).any():
         overall_mean = np.nanmean(col_means[~np.isnan(col_means)]) if np.any(~np.isnan(col_means)) else 0.0
@@ -348,7 +413,8 @@ def build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basi
     inds = np.where(np.isnan(pca_vals))
     if inds[0].size > 0:
         pca_vals[inds] = np.take(col_means, inds[1])
-    return pd.DataFrame(pca_vals, index=pca_df.index, columns=pca_df.columns)
+    
+    return pd.DataFrame(pca_vals, index=pca_df_combined.index, columns=pca_df_combined.columns)
 
 
 pca_df_filled = build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, compounding_model, interp_method)
@@ -412,35 +478,83 @@ st.title("Brazilian DI Futures Yield Curve Forecast")
 
 # --- NEW: PCA Components Heatmap ---
 st.header("Principal Component Analysis Overview")
-st.write("This heatmap shows how each Principal Component (PC) influences different maturities on the yield curve. This is based on the entire training data period.")
+st.write("These heatmaps show how each Principal Component (PC) influences different maturities, spreads, and butterflies. This is based on the entire training data period.")
 st.write("- **PC1 (Level):** Typically shows a parallel shift in the curve.")
-st.write("- **PC2 (Slope):** Typically shows a steepening or flattening of the curve.")
-st.write("- **PC3 (Curvature):** Typically shows a change in the curve's bow or flex.")
+st.write("- **PC2 (Slope):** Typically shows a steepening or flattening of the curve, reflected in spreads.")
+st.write("- **PC3 (Curvature):** Typically shows a change in the curve's bow or flex, reflected in flies.")
 
-fig_heatmap, ax_heatmap = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
+# Get indices for each group of columns
+idx_rates = [pca_df_filled.columns.get_loc(c) for c in std_cols]
+idx_spreads = [pca_df_filled.columns.get_loc(c) for c in pca_df_filled.columns if '-' in c and len(c.split('-')) == 2]
+idx_flies = [pca_df_filled.columns.get_loc(c) for c in pca_df_filled.columns if '-' in c and len(c.split('-')) == 3]
+
+# Plot 1: Loadings for Outright Rates
+fig_rates, ax_rates = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
 sns.heatmap(
-    pca.components_,
+    pca.components_[:, idx_rates],
     xticklabels=std_cols,
     yticklabels=pc_cols,
-    annot=True,
+    annot=True, 
     fmt=".2f",
     cmap='viridis',
-    ax=ax_heatmap
+    ax=ax_rates
 )
-ax_heatmap.set_title("PCA Component Loadings vs. Maturity")
-st.pyplot(fig_heatmap)
+ax_rates.set_title("PCA Component Loadings vs. Outright Rates")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+st.pyplot(fig_rates)
 
+# Plot 2: Loadings for Spreads
+fig_spreads, ax_spreads = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
+sns.heatmap(
+    pca.components_[:, idx_spreads],
+    xticklabels=[c.replace('Spread_', '') for c in pca_df_filled.columns[idx_spreads]],
+    yticklabels=pc_cols,
+    annot=True, 
+    fmt=".2f",
+    cmap='viridis',
+    ax=ax_spreads
+)
+ax_spreads.set_title("PCA Component Loadings vs. Spreads")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+st.pyplot(fig_spreads)
+
+# Plot 3: Loadings for Butterflies
+# Create contract-based labels for the butterfly plot
+fly_maturities = [c.split('-') for c in pca_df_filled.columns[idx_flies]]
+fly_contract_names = []
+for f in fly_maturities:
+    c1, c2, c3 = get_contract_names_for_maturities([float(f[0][:-1]), float(f[1][:-1]), float(f[2][:-1])], expiry_df, pca_df_filled.index.max(), holidays_np, year_basis)
+    fly_contract_names.append(f"{c1}-{c2}-{c3}")
+
+fig_flies, ax_flies = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
+sns.heatmap(
+    pca.components_[:, idx_flies],
+    xticklabels=fly_contract_names,
+    yticklabels=pc_cols,
+    annot=True, 
+    fmt=".2f",
+    cmap='viridis',
+    ax=ax_flies
+)
+ax_flies.set_title("PCA Component Loadings vs. Butterflies (by contract)")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+st.pyplot(fig_flies)
 
 # --- Get the last actual curve ---
 last_actual_ts = yields_df_train.index.max()
-last_actual_curve_on_std = pca_df_filled.loc[last_actual_ts].values
+last_actual_series = pca_df_filled.loc[last_actual_ts]
+last_actual_curve_on_std = last_actual_series[std_cols].values
 
 # --- Get the PREVIOUS day's curve for comparison ---
 prev_actual_ts = None
 prev_actual_curve_on_std = np.full_like(std_arr, np.nan)
 if len(yields_df_train.index) > 1:
     prev_actual_ts = yields_df_train.index[-2]
-    prev_actual_curve_on_std = pca_df_filled.loc[prev_actual_ts].values
+    prev_actual_series = pca_df_filled.loc[prev_actual_ts]
+    prev_actual_curve_on_std = prev_actual_series[std_cols].values
 
 # --------------------------
 # In-sample reconstruction (exact date)
@@ -456,8 +570,9 @@ if not mask_pca.any():
     st.error(f"Selected date {recon_ts.date()} is not present in the training data. Please check your PCA Training Date range in the sidebar.")
 else:
     i = int(np.where(mask_pca)[0][0])
-    recon_curve_std = reconstruct_curve_at_index(i)
-    orig_on_std = pca_df_filled.loc[recon_ts].values
+    recon_full_series = pd.Series(reconstruct_curve_at_index(i), index=pca_df_filled.columns)
+    recon_curve_std = recon_full_series[std_cols].values
+    orig_on_std = pca_df_filled.loc[recon_ts, std_cols].values
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(std_arr, recon_curve_std, marker='o', linestyle='-', color='royalblue', label=f"Reconstructed ({n_components} PCs)")
@@ -473,6 +588,59 @@ else:
     ax.grid(True, which='both', linestyle='--', linewidth=0.5)
     plt.tight_layout()
     st.pyplot(fig)
+    
+    # --- Reconstruction for Spreads and Flies ---
+    st.markdown("---")
+    st.subheader("Spread and Fly Reconstruction")
+    
+    # Get the spread and fly columns
+    spread_cols_full = [col for col in pca_df_filled.columns if '-' in col and len(col.split('-')) == 2]
+    fly_cols_full = [col for col in pca_df_filled.columns if '-' in col and len(col.split('-')) == 3]
+
+    if spread_cols_full and fly_cols_full:
+        orig_spreads = pca_df_filled.loc[recon_ts, spread_cols_full].values
+        recon_spreads = recon_full_series[spread_cols_full].values
+        orig_flies = pca_df_filled.loc[recon_ts, fly_cols_full].values
+        recon_flies = recon_full_series[fly_cols_full].values
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # Spreads Plot
+        ax1.plot(spread_cols_full, recon_spreads, marker='o', linestyle='-', color='royalblue', label=f"Reconstructed Spreads")
+        ax1.plot(spread_cols_full, orig_spreads, marker='x', linestyle='--', color='darkorange', label="Original Spreads")
+        ax1.set_title("Spread Reconstruction")
+        ax1.set_ylabel("Spread (bps)")
+        ax1.set_xlabel("Spread (Years)")
+        ax1.set_xticklabels(spread_cols_full, rotation=45, ha="right")
+        ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax1.legend()
+        
+        # Flies Plot
+        ax2.plot(fly_cols_full, recon_flies, marker='o', linestyle='-', color='royalblue', label=f"Reconstructed Flies")
+        ax2.plot(fly_cols_full, orig_flies, marker='x', linestyle='--', color='darkorange', label="Original Flies")
+        ax2.set_title("Fly Reconstruction")
+        ax2.set_ylabel("Fly (bps)")
+        ax2.set_xlabel("Fly (Years)")
+        ax2.set_xticklabels(fly_cols_full, rotation=45, ha="right")
+        ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax2.legend()
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+
+# --- NEW: In-sample Spread Analysis (Table) ---
+st.markdown("---")
+st.subheader("In-Sample Spread Analysis")
+st.write(f"This table compares the **Original** market spread values to the **PCA-based** reconstructed spread values for the selected reconstruction date ({recon_ts.date()}).")
+
+# Calculate original spreads based on the interpolated grid
+spread_cols_full = [col for col in pca_df_filled.columns if '-' in col and len(col.split('-')) == 2]
+orig_spreads = pca_df_filled.loc[recon_ts, spread_cols_full].rename("Original Spreads (bps)")
+recon_spreads = recon_full_series[spread_cols_full].rename("PCA Reconstructed Spreads (bps)")
+
+spread_df_compare = pd.concat([orig_spreads, recon_spreads], axis=1)
+st.dataframe(spread_df_compare.style.format("{:.2f}"))
+
 
 # --------------------------
 # Next-BD forecast
@@ -488,7 +656,7 @@ if forecast_model_type == "None (PCA Fair Value)":
     st.write("Using **PCA Fair Value** model (no momentum or external forecast)")
     # The "Fair Value" forecast is the smooth, reconstructed curve of the last day.
     last_day_pcs_index = pca_df_filled.index.get_loc(last_actual_ts)
-    pred_curve_std = reconstruct_curve_at_index(last_day_pcs_index)
+    pred_full_series = pd.Series(reconstruct_curve_at_index(last_day_pcs_index), index=pca_df_filled.columns)
 else:
     if forecast_model_type == "Average Delta (Momentum)":
         st.write(f"Using **{forecast_model_type}** model")
@@ -503,17 +671,20 @@ else:
     # Apply the predicted CHANGE to the last known actual curve
     last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
     delta_pcs = pcs_next - last_pcs
-    delta_curve = pca.inverse_transform(delta_pcs)
-    pred_curve_std = last_actual_curve_on_std + delta_curve.flatten()
+    delta_vals = pca.inverse_transform(delta_pcs).flatten()
+    
+    last_actual_vals = last_actual_series.values
+    pred_vals = last_actual_vals + delta_vals
+    
+    pred_full_series = pd.Series(pred_vals, index=pca_df_filled.columns)
 
 # --- Apply Capping to momentum-based models ---
 if apply_cap and cap_bps > 0 and forecast_model_type != "None (PCA Fair Value)":
-    delta = pred_curve_std - last_actual_curve_on_std
+    delta = pred_full_series[std_cols] - last_actual_series[std_cols]
     delta = np.clip(delta, -cap_frac, cap_frac)
-    capped_pred_std = last_actual_curve_on_std + delta
+    capped_pred_std = last_actual_series[std_cols] + delta
 else:
-    capped_pred_std = pred_curve_std
-
+    capped_pred_std = pred_full_series[std_cols]
 
 # --- Convert curves from standard grid back to contracts ---
 all_contracts = yields_df.columns
@@ -561,7 +732,7 @@ st.write("A positive spread means the actual market rate is higher than the mode
 
 # Calculate the PCA Fair Value for the last actual day
 last_day_pcs_index = pca_df_filled.index.get_loc(last_actual_ts)
-fair_value_std = reconstruct_curve_at_index(last_day_pcs_index)
+fair_value_std = pd.Series(reconstruct_curve_at_index(last_day_pcs_index), index=pca_df_filled.columns)[std_cols]
 fair_value_contracts = std_grid_to_contracts(last_actual_ts, fair_value_std, std_arr, expiry_df, all_contracts, holidays_np, year_basis, rate_unit, compounding_model, interp_method)
 
 # Align the series and calculate the spread
@@ -585,3 +756,72 @@ spread_df = pd.DataFrame({
     "Spread (bps)": spread_bps
 })
 st.dataframe(spread_df.style.format("{:.2f}"))
+
+# --------------------------
+# New section: Forecasted Spreads and Flies
+# --------------------------
+st.markdown("---")
+st.header("Forecasted Spreads and Butterflies (by Contract)")
+st.write("This section visualizes the **forecasted changes** in spreads and butterflies for the next business day.")
+st.write("A positive change means a steepening spread or a more positive butterfly. A negative change means a flattening spread or a more negative butterfly.")
+
+# Calculate last actual spreads/flies and forecasted spreads/flies
+last_spreads = last_actual_series[idx_spreads]
+last_flies = last_actual_series[idx_flies]
+forecasted_spreads = pred_full_series[idx_spreads]
+forecasted_flies = pred_full_series[idx_flies]
+
+# Get the maturity-based labels for spreads and flies
+spread_labels = last_spreads.index.tolist()
+fly_labels = last_flies.index.tolist()
+
+# Get the contract-based labels using the new helper function
+spread_contract_labels = get_contract_names_for_spreads_flies(spread_labels, expiry_df, last_actual_ts, holidays_np, year_basis)
+fly_contract_labels = get_contract_names_for_spreads_flies(fly_labels, expiry_df, last_actual_ts, holidays_np, year_basis)
+
+# Plotting the changes
+fig_forecast, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+
+# Spreads Plot
+ax1.plot(spread_contract_labels, last_spreads, marker='o', linestyle='-', color='gray', label=f"Last Actual Spreads ({last_actual_ts.date()})")
+ax1.plot(spread_contract_labels, forecasted_spreads, marker='x', linestyle='--', color='darkorange', label=f"Forecasted Spreads ({forecast_ts.date()})")
+ax1.set_title("Forecasted Spread Analysis")
+ax1.set_ylabel("Spread (bps)")
+ax1.set_xlabel("Spread (Contracts)")
+ax1.set_xticklabels(spread_contract_labels, rotation=45, ha="right")
+ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+ax1.legend()
+
+# Flies Plot
+ax2.plot(fly_contract_labels, last_flies, marker='o', linestyle='-', color='gray', label=f"Last Actual Flies ({last_actual_ts.date()})")
+ax2.plot(fly_contract_labels, forecasted_flies, marker='x', linestyle='--', color='darkorange', label=f"Forecasted Flies ({forecast_ts.date()})")
+ax2.set_title("Forecasted Butterfly Analysis")
+ax2.set_ylabel("Fly (bps)")
+ax2.set_xlabel("Fly (Contracts)")
+ax2.set_xticklabels(fly_contract_labels, rotation=45, ha="right")
+ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+ax2.legend()
+
+plt.tight_layout()
+st.pyplot(fig_forecast)
+
+# Table for comparison
+st.subheader("Forecasted Spread and Butterfly Values")
+
+# Create a table for spreads
+spread_table = pd.DataFrame({
+    f"Last Actual ({last_actual_ts.date()})": last_spreads.values,
+    f"Forecasted ({forecast_ts.date()})": forecasted_spreads.values,
+    "Change": forecasted_spreads.values - last_spreads.values
+}, index=spread_contract_labels)
+st.markdown("**Spreads**")
+st.dataframe(spread_table.style.format("{:.2f}"))
+
+# Create a table for flies
+fly_table = pd.DataFrame({
+    f"Last Actual ({last_actual_ts.date()})": last_flies.values,
+    f"Forecasted ({forecast_ts.date()})": forecasted_flies.values,
+    "Change": forecasted_flies.values - last_flies.values
+}, index=fly_contract_labels)
+st.markdown("**Butterflies**")
+st.dataframe(fly_table.style.format("{:.2f}"))
