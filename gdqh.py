@@ -14,6 +14,7 @@
 #  - **NEW: Added spreads and butterflies to the PCA analysis.**
 #  - **NEW: Added a contract-based butterfly chart and spread comparison table.**
 #  - **NEW: Added forecasted spreads and butterflies with contract ticker labels.**
+#  - **FIXED: Butterfly contract mapping and labeling.**
 #
 # Includes:
 #  - No "fallback" bug: reconstruction honors the chosen date exactly.
@@ -317,7 +318,6 @@ def std_grid_to_contracts(dt, std_curve_rates, std_arr, expiry_df, all_contracts
             rate_frac = zero_frac
         else:
             T = int(np_busdays_exclusive(dt, exp, holidays_np))
-            if T == 0: continue
             DF = (1.0 + zero_frac) ** (-t)
             r_daily = DF ** (-1.0 / T) - 1.0
             rate_frac = r_daily * float(year_basis)
@@ -363,17 +363,34 @@ def get_contract_names_for_maturities(maturities_list, expiry_df, last_date, hol
 
 def get_contract_names_for_spreads_flies(maturity_labels, expiry_df, last_date, holidays_np, year_basis):
     """
-    Maps maturity-based spread and fly labels (e.g., '0.50Y-0.25Y') to contract tickers.
+    Maps maturity-based spread and fly labels to contract tickers.
+    Correctly formats flies with a / separator to distinguish from spreads.
     """
     contract_labels = []
     for label in maturity_labels:
         parts = label.split('-')
         maturities = [float(p[:-1]) for p in parts]
+        
         contracts = get_contract_names_for_maturities(maturities, expiry_df, last_date, holidays_np, year_basis)
-        if 'N/A' in contracts:
+        
+        if 'N/A' in contracts or len(contracts) != len(parts):
             contract_labels.append('N/A')
-        else:
+            continue
+        
+        if len(parts) == 2:
+            # It's a spread
             contract_labels.append('-'.join(contracts))
+        elif len(parts) == 3:
+            # It's a fly, format using /
+            # The calculation is (back-body)-(body-front), so we'll label it
+            # FRONT/BODY/BACK. We need to re-order the `parts` because
+            # fly_cols are generated as `back-body-front`.
+            maturities_sorted = sorted(maturities)
+            contracts_sorted = get_contract_names_for_maturities(maturities_sorted, expiry_df, last_date, holidays_np, year_basis)
+            contract_labels.append('/'.join(contracts_sorted))
+        else:
+            contract_labels.append('N/A')
+            
     return contract_labels
 
 # @st.cache_data
@@ -521,24 +538,17 @@ plt.tight_layout()
 st.pyplot(fig_spreads)
 
 # Plot 3: Loadings for Butterflies
-# Create contract-based labels for the butterfly plot
-fly_maturities = [c.split('-') for c in pca_df_filled.columns[idx_flies]]
-fly_contract_names = []
-for f in fly_maturities:
-    c1, c2, c3 = get_contract_names_for_maturities([float(f[0][:-1]), float(f[1][:-1]), float(f[2][:-1])], expiry_df, pca_df_filled.index.max(), holidays_np, year_basis)
-    fly_contract_names.append(f"{c1}-{c2}-{c3}")
-
 fig_flies, ax_flies = plt.subplots(figsize=(12, max(4, n_components * 1.5)))
 sns.heatmap(
     pca.components_[:, idx_flies],
-    xticklabels=fly_contract_names,
+    xticklabels=[c.replace('Fly_', '') for c in pca_df_filled.columns[idx_flies]],
     yticklabels=pc_cols,
     annot=True, 
     fmt=".2f",
     cmap='viridis',
     ax=ax_flies
 )
-ax_flies.set_title("PCA Component Loadings vs. Butterflies (by contract)")
+ax_flies.set_title("PCA Component Loadings vs. Butterflies (by Maturity)")
 plt.xticks(rotation=45, ha="right")
 plt.tight_layout()
 st.pyplot(fig_flies)
